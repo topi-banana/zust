@@ -11,7 +11,7 @@ mod stamp;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: zustc <input.rs> [-o out] [-O] [--backend=cranelift|minclif] [--target=wasm32-unknown-unknown] [--linker=NAME] [--features=a,b] [-L dir] [--time] [-j N] [--no-cache]\n       zustc build <workspace-file> [-o out-dir] [-O] [--backend=..] [-j N] [--time] [--no-cache]\n       zustc check <input.rs>"
+        "usage: zustc <input.rs> [-o out] [-O] [--backend=cranelift|minclif] [--target=wasm32-unknown-unknown|wasm32-wasip1|wasm32-wasip2] [--linker=NAME] [--features=a,b] [-L dir] [--time] [-j N] [--no-cache]\n       zustc build <workspace-file> [-o out-dir] [-O] [--backend=..] [-j N] [--time] [--no-cache]\n       zustc check <input.rs>"
     );
     std::process::exit(2)
 }
@@ -78,8 +78,19 @@ fn main() {
             backend = "wasm".to_string();
             o.module_writer = Some(zustc::wasm_backend::write_module);
         }
+        // (WASI: the same backend, a writer that imports wasi_snapshot_preview1 and synthesizes _start)
+        "wasm32-wasip1" => {
+            backend = "wasm".to_string();
+            o.module_writer = Some(zustc::wasm_backend::write_module_wasip1);
+            o.wasi = true;
+        }
+        "wasm32-wasip2" => {
+            backend = "wasm".to_string();
+            o.module_writer = Some(zustc::wasm_backend::write_module_wasip2);
+            o.wasi = true;
+        }
         t => {
-            eprintln!("error: unknown target `{t}` (x86_64-unknown-linux-gnu / wasm32-unknown-unknown)");
+            eprintln!("error: unknown target `{t}` (x86_64-unknown-linux-gnu / wasm32-unknown-unknown / wasm32-wasip1 / wasm32-wasip2)");
             std::process::exit(2);
         }
     }

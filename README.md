@@ -21,7 +21,8 @@
 > **Status**: experimental.
 >
 > - zustc targets Linux x86-64 and does not support all of Rust ([supported language](docs/language.md)).
->   `--target wasm32-unknown-unknown` writes a wasm module (experimental: [tests/wasm/README.md](tests/wasm/README.md)).
+>   `--target wasm32-unknown-unknown` writes a wasm module (experimental: [tests/wasm/README.md](tests/wasm/README.md));
+>   `--target wasm32-wasip1` / `wasm32-wasip2` write WASI modules that run under wasmtime.
 > - Security regression tests from past Rust CVEs and soundness bugs: [tests/security/README.md](tests/security/README.md).
 >   What zustc does not catch yet, and what else is left: [TODO.md](TODO.md).
 > - zustc's checks (types, borrow checking, region errors against signatures) are partial, so it is not a replacement for rustc for checking correctness.
@@ -272,6 +273,7 @@ zustc build workspace.txt -o target
 | `-o PATH` | output path (the output directory for `build`) |
 | `-O` | optimize: inline small functions and use Cranelift's `speed` level. Disables overflow checks |
 | `--backend=cranelift\|minclif` | code generator (default cranelift; also `ZUSTC_BACKEND`) |
+| `--target=TRIPLE` | cross-compile target: `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2` (default: host `x86_64-unknown-linux-gnu`) |
 | `--linker=wild\|mold\|lld\|bfd\|PATH` | choose the linker |
 | `--features=a,b` | enable `#[cfg(feature = "..")]` |
 | `-j N` | number of code generation threads |
@@ -280,6 +282,44 @@ zustc build workspace.txt -o target
 
 Panics are reported in the same form as rustc: `thread 'main' panicked at src/main.rs:LINE:COL:`, then the message,
 then exit code 101. Integer overflow is checked as in a rustc debug build; `-O` turns the checks off.
+
+### WebAssembly targets
+
+`--target=` selects a wasm target and writes the module to the `-o` path directly (no external linker):
+
+```bash
+zustc prog.rs --target=wasm32-wasip1 -o prog.wasm
+wasmtime prog.wasm                                 # WASI preview1: runs via a synthesized _start
+
+zustc lib.rs --target=wasm32-unknown-unknown -o lib.wasm
+wasmtime --invoke fib lib.wasm 10                  # library-like: call exported functions directly
+```
+
+- `wasm32-wasip1` / `wasm32-wasip2`: WASI command modules. `main` is required; a synthesized `_start` calls it and
+  exits with its return code. `wasm32-wasip2` currently emits the same preview1-compatible core module as wasip1.
+  `putchar` / `write` / `exit` / `abort` are mapped to `wasi_snapshot_preview1` (`fd_write` / `proc_exit`);
+  `fflush` / `close` / `sigaction` are no-ops, `getchar` / `read` are EOF (no stdin), and `memmem` / `round` /
+  `roundf` are provided in the module (`round` rounds halves away from zero, as on the host).
+- `wasm32-unknown-unknown`: library-like, for the sandbox host of [tests/wasm/README.md](tests/wasm/README.md).
+  `#[no_mangle] pub extern "C"` functions (and `main`) are exported; unknown externs become `env` imports.
+  `#![crate_type="lib"]` builds a library without `main`.
+- The `malloc` / `free` / `realloc` / `calloc` / `memset` / `memcpy` / `memmove` / `strlen` / `strerror` /
+  `__errno_location` runtime is built in, so `Vec` / `String` / `Box` and the std collections work.
+  `cfg(target_arch = "wasm32")`, `cfg(target_family = "wasm")` and `cfg(target_os = "wasi")` select as expected.
+- `-O` works as on the host. The wasm backend lowers the same recorded instructions as the native backends, so
+  caching and incremental rebuilds work the same way.
+
+Scope and limits: pointers and `usize` stay 8 bytes (the layouts are those of x86-64, so
+`cfg(target_pointer_width = "64")` is true), living in the low 4 GiB of linear memory. `i128` / `u128` are not
+supported yet. Float transcendentals (`sin` / `cos` / `exp` / `ln` / `powf`, `strtod`, …) are not provided, so
+programs that use them do not run; `sqrt` / `abs` / `floor` / `ceil` / `trunc` / `round` / `powi` work. Float
+literals and float `Display` need `strtod`, so derive floats from integers (`1 as f64 / 2 as f64`) and print them
+via integer casts. A panic traps (`unreachable`) without a message. Workspace builds and linking several crates
+into one module are not supported yet.
+
+The regression tests `tests/driver2_wasm.rs` build and run the `no_std` cases and the std examples under `wasmtime`
+on all three targets (skipped when `wasmtime` is absent); `tests/wasm.rs` checks the unknown-unknown sandbox under
+Node (skipped when `node` or `rustc` is absent).
 
 ## Using zust-analyzer
 

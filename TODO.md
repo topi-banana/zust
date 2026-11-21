@@ -74,6 +74,9 @@ behavior: `cve_2020_36323_join_borrow` (join over a `Borrow<str>` of the program
   - workspace builds (`zustc build`);
   - zustc built as wasm by itself.
 - Traps carry no panic message (the native build prints the location from its trap table).
+- `wasm32-wasip1` / `wasm32-wasip2` run under wasmtime via a synthesized `_start` (`tests/driver2_wasm.rs`).
+  No stdin, files or arguments yet: `getchar` / `read` are EOF, and `open` is not provided, so `std::env::args`
+  and `std::fs` do not run. `fd_read` / `args_get` of preview1 are the next step.
 
 ## Tooling
 

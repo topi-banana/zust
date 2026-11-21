@@ -269,6 +269,8 @@ pub struct Options2 {
     /// wasm32-unknown-unknown: writes the module instead of an ELF object, and does not link (zust_wasm::write_module;
     /// `backend` is then zust_wasm::compile)
     pub module_writer: Option<ModuleWriter>,
+    /// the wasm target is wasm32-wasip1 / wasip2 (WASI): `cfg(target_os = "wasi")`, and the writer synthesizes `_start`
+    pub wasi: bool,
 }
 
 /// Writes the output from the functions and data build.rs lays out (in place of the ELF object)
@@ -276,7 +278,7 @@ pub type ModuleWriter = fn(&[(String, Vec<u8>, Vec<crate::ir::Reloc>, bool)], &[
 
 impl Default for Options2 {
     fn default() -> Self {
-        Options2 { opt: false, jobs: cpu_count(), linker: None, lib_dirs: vec![], no_cache: false, time: false, backend: None, features: vec![], module_writer: None }
+        Options2 { opt: false, jobs: cpu_count(), linker: None, lib_dirs: vec![], no_cache: false, time: false, backend: None, features: vec![], module_writer: None, wasi: false }
     }
 }
 
@@ -293,7 +295,7 @@ impl Options2 {
 
     /// cfg の述語の設定 (features は与えたもの)
     pub fn cfg_with(&self, features: &[String]) -> crate::cfg::CfgSet {
-        crate::cfg::CfgSet { features: features.to_vec(), debug_assertions: !self.opt, wasm: self.module_writer.is_some() }
+        crate::cfg::CfgSet { features: features.to_vec(), debug_assertions: !self.opt, wasm: self.module_writer.is_some(), wasi: self.wasi }
     }
 }
 

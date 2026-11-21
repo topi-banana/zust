@@ -626,10 +626,15 @@ impl<'a> Body<'a> {
         if t == Type::I128 {
             return Err("wasm32: this i128 operation is not supported yet".into());
         }
+        // (a pointer I64 plus an index I32 mixes widths: x86 extends implicitly, wasm needs matching types.
+        //  compute in the wider width, zero-extending the narrow side)
+        let wide = t == Type::I64 || self.ty(y) == Type::I64;
         if signed { self.get_s(x)? } else { self.get(x)? }
+        if wide && t != Type::I64 { self.op(0xAD); }
         if signed { self.get_s(y)? } else { self.get(y)? }
-        self.op(if t == Type::I64 { op64 } else { op32 });
-        self.norm(t);
+        if wide && self.ty(y) != Type::I64 { self.op(0xAD); }
+        self.op(if wide { op64 } else { op32 });
+        if !wide { self.norm(t); }
         Ok(())
     }
 
@@ -2062,11 +2067,28 @@ pub type DataDef = (String, Vec<u8>, Vec<(u32, String, i64)>, bool);
 /// The functions the module provides itself when the program calls them (instead of importing them)
 const BUILTINS: &[&str] = &["malloc", "free", "realloc", "calloc", "__errno_location", "strerror", "strlen", "memcpy", "memmove", "memset"];
 
-/// Where the built-ins keep their state: the free-list heads, errno, strerror's text
+/// The wasm target a module is written for
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WasmTarget {
+    /// wasm32-unknown-unknown: library-like, `env` imports, exports `memory` and the flagged functions
+    Unknown,
+    /// wasm32-wasip1: WASI preview1 command module (`wasi_snapshot_preview1` imports, a synthesized `_start`)
+    WasiP1,
+    /// wasm32-wasip2: currently the same preview1-compatible core module as wasip1
+    WasiP2,
+}
+
+/// Extra functions a WASI module provides itself: stdio / process over `fd_write` / `proc_exit`, and no-op or
+/// pure shims for what the std runtime calls but a sandbox has no host for (signals, stdin, `round`, `memmem`)
+const WASI_SHIMS: &[&str] = &["putchar", "write", "exit", "abort", "fflush", "getchar", "read", "close", "sigaction", "__exr_trap_at", "memmem", "round", "roundf"];
+
+/// Where the built-ins keep their state: the free-list heads, errno, strerror's text, and (WASI) the iovec scratch
 struct Layout {
     free_base: i64,
     errno: i64,
     msg: i64,
+    /// WASI only: a 32-byte scratch for `fd_write`'s iovec (buf, len) and the nwritten out-parameter
+    scratch: i64,
 }
 
 /// strerror's one text (the host gives no error numbers)
@@ -2258,11 +2280,116 @@ fn builtin_body(name: &str, lay: &Layout, idx: &dyn Fn(&str) -> u32) -> (Vec<u8>
     (params, rets, body)
 }
 
-/// Writes the module: imports (module `env`) for what is called but not defined, the functions, one table for the
-/// functions whose address is taken (index 0 is null), the memory (stack first, then data, then heap), the stack
-/// pointer and heap top globals, and exports (`memory`, `main` and the exported functions)
+/// The bodies of the WASI shims: stdio / process over the `fd_write` / `proc_exit` imports, no-ops for what a
+/// sandbox has no host for, and pure `memmem` / `round` / `roundf`. `idx` resolves the WASI imports' function indices
+fn wasi_shim_body(name: &str, lay: &Layout, idx: &dyn Fn(&str) -> u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let s = lay.scratch;
+    let mut a = Asm { c: vec![] };
+    // (params, results, local groups, code)
+    let (params, rets, locals, code): (Vec<u8>, Vec<u8>, Vec<(u32, u8)>, Vec<u8>) = match name {
+        // putchar(c) -> c: store the byte, build a one-byte iovec, fd_write(1, iov, 1, &nwritten)
+        "putchar" => {
+            a.o(&[0x41]); sleb(&mut a.c, s); a.o(&[0x20, 0x00, 0x3A, 0x00, 0x00]); // [s] = c
+            a.o(&[0x41]); sleb(&mut a.c, s + 8); a.o(&[0x41]); sleb(&mut a.c, s); a.o(&[0x36, 0x02, 0x00]); // iov.buf = s
+            a.o(&[0x41]); sleb(&mut a.c, s + 12); a.o(&[0x41, 0x01, 0x36, 0x02, 0x00]); // iov.len = 1
+            a.o(&[0x41, 0x01, 0x41]); sleb(&mut a.c, s + 8); a.o(&[0x41, 0x01, 0x41]); sleb(&mut a.c, s + 16);
+            a.call(idx("fd_write"));
+            a.o(&[0x1A, 0x20, 0x00]); // drop nwritten; return c
+            (vec![T_I32], vec![T_I32], vec![], std::mem::take(&mut a.c))
+        }
+        // write(fd, p, n) -> n: a one-iovec fd_write of the caller's buffer
+        "write" => {
+            a.o(&[0x41]); sleb(&mut a.c, s + 8); a.o(&[0x20, 0x01, 0xA7, 0x36, 0x02, 0x00]); // iov.buf = p
+            a.o(&[0x41]); sleb(&mut a.c, s + 12); a.o(&[0x20, 0x02, 0xA7, 0x36, 0x02, 0x00]); // iov.len = n
+            a.o(&[0x20, 0x00, 0x41]); sleb(&mut a.c, s + 8); a.o(&[0x41, 0x01, 0x41]); sleb(&mut a.c, s + 16);
+            a.call(idx("fd_write"));
+            a.o(&[0x1A, 0x20, 0x02]); // drop nwritten; return n
+            (vec![T_I32, T_I64, T_I64], vec![T_I64], vec![], std::mem::take(&mut a.c))
+        }
+        "exit" => { a.get(0); a.call(idx("proc_exit")); (vec![T_I32], vec![], vec![], std::mem::take(&mut a.c)) }
+        "abort" => { a.o(&[0x41, 0x86, 0x01]); a.call(idx("proc_exit")); (vec![], vec![], vec![], std::mem::take(&mut a.c)) } // 134
+        // no host for signals or stdin: fflush / close / sigaction succeed, getchar / read are EOF
+        "fflush" => { a.o(&[0x41, 0x00]); (vec![T_I64], vec![T_I32], vec![], std::mem::take(&mut a.c)) }
+        "getchar" => { a.o(&[0x41, 0x7F]); (vec![], vec![T_I32], vec![], std::mem::take(&mut a.c)) } // -1
+        "read" => { a.k(0); (vec![T_I32, T_I64, T_I64], vec![T_I64], vec![], std::mem::take(&mut a.c)) }
+        "close" => { a.o(&[0x41, 0x00]); (vec![T_I32], vec![T_I32], vec![], std::mem::take(&mut a.c)) }
+        "sigaction" => { a.o(&[0x41, 0x00]); (vec![T_I32, T_I64, T_I64], vec![T_I32], vec![], std::mem::take(&mut a.c)) }
+        // a panic trap stops the module (the host's absolute-address trap table does not apply here)
+        "__exr_trap_at" => { a.o(&[0x00]); (vec![T_I64], vec![], vec![], std::mem::take(&mut a.c)) }
+        // memmem(h, hl, n, nl) -> h+i or 0 (empty needle -> h). locals: 4 h32, 5 hl32, 6 n32, 7 nl32, 8 i, 9 j, 10 result
+        "memmem" => {
+            let c = vec![
+                0x20, 0x00, 0xA7, 0x21, 0x04, 0x20, 0x01, 0xA7, 0x21, 0x05, 0x20, 0x02, 0xA7, 0x21, 0x06, 0x20, 0x03, 0xA7, 0x21, 0x07,
+                0x42, 0x00, 0x21, 0x0A, 0x41, 0x00, 0x21, 0x08, 0x02, 0x40, 0x03, 0x40,
+                0x20, 0x0A, 0x50, 0x45, 0x0D, 0x01,
+                0x20, 0x05, 0x20, 0x07, 0x49, 0x20, 0x08, 0x20, 0x05, 0x20, 0x07, 0x6B, 0x4B, 0x72, 0x0D, 0x01,
+                0x41, 0x00, 0x21, 0x09, 0x02, 0x40, 0x03, 0x40,
+                0x20, 0x09, 0x20, 0x07, 0x46, 0x04, 0x40, 0x20, 0x04, 0x20, 0x08, 0x6A, 0xAD, 0x21, 0x0A, 0x0C, 0x02, 0x0B,
+                0x20, 0x04, 0x20, 0x08, 0x6A, 0x20, 0x09, 0x6A, 0x2D, 0x00, 0x00,
+                0x20, 0x06, 0x20, 0x09, 0x6A, 0x2D, 0x00, 0x00, 0x47, 0x0D, 0x01,
+                0x20, 0x09, 0x41, 0x01, 0x6A, 0x21, 0x09, 0x0C, 0x00, 0x0B, 0x0B,
+                0x20, 0x08, 0x41, 0x01, 0x6A, 0x21, 0x08, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x0A,
+            ];
+            (vec![T_I64, T_I64, T_I64, T_I64], vec![T_I64], vec![(6, T_I32), (1, T_I64)], c)
+        }
+        // round(x): half away from zero (wasm `nearest` rounds halves to even). t = trunc(x); |x-t| >= 0.5 ? t+copysign(1,x) : t
+        "round" => {
+            let c = vec![
+                0x20, 0x00, 0x20, 0x00, 0x9D, 0x22, 0x01, 0xA1, 0x99,
+                0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x3F, 0x66, 0x04, T_F64,
+                0x20, 0x01, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x20, 0x00, 0xA6, 0xA0,
+                0x05, 0x20, 0x01, 0x0B,
+            ];
+            (vec![T_F64], vec![T_F64], vec![(1, T_F64)], c)
+        }
+        "roundf" => {
+            let c = vec![
+                0x20, 0x00, 0x20, 0x00, 0x8F, 0x22, 0x01, 0x93, 0x8B,
+                0x43, 0x00, 0x00, 0x00, 0x3F, 0x60, 0x04, T_F32,
+                0x20, 0x01, 0x43, 0x00, 0x00, 0x80, 0x3F, 0x20, 0x00, 0x98, 0x92,
+                0x05, 0x20, 0x01, 0x0B,
+            ];
+            (vec![T_F32], vec![T_F32], vec![(1, T_F32)], c)
+        }
+        _ => unreachable!("wasi_shim_body: {name}"),
+    };
+    let mut body = vec![];
+    if locals.is_empty() {
+        uleb(&mut body, 0);
+    } else {
+        uleb(&mut body, locals.len() as u64);
+        for (n, t) in &locals {
+            uleb(&mut body, *n as u64);
+            body.push(*t);
+        }
+    }
+    body.extend_from_slice(&code);
+    body.push(0x0B);
+    (params, rets, body)
+}
+
+/// Writes a wasm32-unknown-unknown module (see [`write_module_inner`])
 pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, String> {
+    write_module_inner(funcs, datas, WasmTarget::Unknown)
+}
+
+/// Writes a wasm32-wasip1 module: WASI preview1 imports and a synthesized `_start`
+pub fn write_module_wasip1(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, String> {
+    write_module_inner(funcs, datas, WasmTarget::WasiP1)
+}
+
+/// Writes a wasm32-wasip2 module (currently the same preview1-compatible core module as wasip1)
+pub fn write_module_wasip2(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, String> {
+    write_module_inner(funcs, datas, WasmTarget::WasiP2)
+}
+
+/// Writes the module: imports (module `env`, or `wasi_snapshot_preview1` for a WASI target) for what is called but
+/// not defined, the functions, one table for the functions whose address is taken (index 0 is null), the memory
+/// (stack first, then data, then heap), the stack pointer and heap top globals, and exports (`memory` and the
+/// exported functions; a WASI target exports `memory` and a synthesized `_start` that calls `main` then `proc_exit`)
+fn write_module_inner(funcs: &[FuncDef], datas: &[DataDef], target: WasmTarget) -> Result<Vec<u8>, String> {
     use std::collections::HashMap;
+    let wasi = target != WasmTarget::Unknown;
     let mut fidx: HashMap<String, u32> = HashMap::new();
     let mut data_addr: HashMap<String, u64> = HashMap::new();
     // data layout: after the null page and the stack
@@ -2273,16 +2400,20 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
         addr += d.1.len().max(1) as u64;
     }
     let free_base = addr.div_ceil(16) * 16;
-    let lay = Layout { free_base: free_base as i64, errno: free_base as i64 + 64 * 8, msg: free_base as i64 + 64 * 8 + 16 };
-    let heap_base = (lay.msg as u64 + ERR_TEXT.len() as u64).div_ceil(16) * 16;
+    let after_msg = (free_base as u64 + 64 * 8 + 16 + ERR_TEXT.len() as u64).div_ceil(16) * 16;
+    // (WASI: a 32-byte iovec scratch after strerror's text; unknown-unknown keeps the original layout)
+    let scratch = after_msg as i64;
+    let heap_base = if wasi { (after_msg + 32).div_ceil(16) * 16 } else { after_msg };
+    let lay = Layout { free_base: free_base as i64, errno: free_base as i64 + 64 * 8, msg: free_base as i64 + 64 * 8 + 16, scratch };
     // imports: called names that are neither defined nor built in, in order of first use
     let defined: std::collections::HashSet<&str> = funcs.iter().map(|f| f.0.as_str()).collect();
     let mut imports: Vec<(String, i64)> = vec![];
     let mut builtins: Vec<&str> = vec![];
     let need_builtin = |n: &str, builtins: &mut Vec<&str>| {
-        if let Some(b) = BUILTINS.iter().find(|b| **b == n) {
-            if !builtins.contains(b) {
-                builtins.push(*b);
+        let canon = BUILTINS.iter().find(|b| **b == n).copied().or_else(|| if wasi { WASI_SHIMS.iter().find(|b| **b == n).copied() } else { None });
+        if let Some(b) = canon {
+            if !builtins.contains(&b) {
+                builtins.push(b);
             }
             // (realloc and calloc call malloc and free)
             if matches!(n, "realloc" | "calloc") {
@@ -2319,15 +2450,34 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
             }
         }
     }
+    // (WASI: the preview1 imports the shims and _start call)
+    let mut wasi_imports: Vec<(String, i64)> = vec![];
+    if wasi {
+        if builtins.iter().any(|b| *b == "putchar" || *b == "write") {
+            wasi_imports.push(("fd_write".into(), sig_enc(&[T_I32, T_I32, T_I32, T_I32], &[T_I32])?));
+        }
+        // (_start always ends in proc_exit)
+        wasi_imports.push(("proc_exit".into(), sig_enc(&[T_I32], &[])?));
+    }
     let ni = imports.len() as u32;
+    let nw = wasi_imports.len() as u32;
     for (i, im) in imports.iter().enumerate() {
         fidx.insert(im.0.clone(), i as u32);
     }
-    for (i, f) in funcs.iter().enumerate() {
-        fidx.insert(f.0.clone(), ni + i as u32);
+    for (i, im) in wasi_imports.iter().enumerate() {
+        fidx.insert(im.0.clone(), ni + i as u32);
     }
+    let func_base = ni + nw;
+    for (i, f) in funcs.iter().enumerate() {
+        fidx.insert(f.0.clone(), func_base + i as u32);
+    }
+    let builtin_base = func_base + funcs.len() as u32;
     for (i, b) in builtins.iter().enumerate() {
-        fidx.entry(b.to_string()).or_insert(ni + funcs.len() as u32 + i as u32);
+        fidx.entry(b.to_string()).or_insert(builtin_base + i as u32);
+    }
+    let start_idx = builtin_base + builtins.len() as u32;
+    if wasi {
+        fidx.insert("_start".into(), start_idx);
     }
     // types
     let mut types: Vec<i64> = vec![];
@@ -2346,6 +2496,7 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
         type_of(im.1, &mut types);
     }
     let import_types: Vec<u32> = imports.iter().map(|im| type_of(im.1, &mut types)).collect();
+    let wasi_import_types: Vec<u32> = wasi_imports.iter().map(|im| type_of(im.1, &mut types)).collect();
     // the table: functions whose address is taken (from code and from data), index 0 is null
     let mut table: Vec<u32> = vec![];
     let mut table_idx: HashMap<String, u32> = HashMap::new();
@@ -2353,7 +2504,7 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
         if let Some(&t) = table_idx.get(n) {
             return Ok(t as i64);
         }
-        let f = *fidx.get(n).ok_or_else(|| format!("wasm32: undefined symbol `{n}` (not available on wasm32-unknown-unknown)"))?;
+        let f = *fidx.get(n).ok_or_else(|| format!("wasm32: undefined symbol `{n}` (not available on this wasm target)"))?;
         table.push(f);
         let t = table.len() as u32;
         table_idx.insert(n.to_string(), t);
@@ -2391,7 +2542,7 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
         bodies.push(body);
     }
     for b in &builtins {
-        let (p, r, body) = builtin_body(b, &lay, &|n| fidx[n]);
+        let (p, r, body) = if BUILTINS.iter().any(|x| x == b) { builtin_body(b, &lay, &|n| fidx[n]) } else { wasi_shim_body(b, &lay, &|n| fidx[n]) };
         let sig = sig_enc(&p, &r)?;
         // (a call with another signature would not validate: say which)
         for f in funcs {
@@ -2400,6 +2551,25 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
             }
         }
         func_types.push(type_of(sig, &mut types));
+        bodies.push(body);
+    }
+    // (WASI: _start calls main, then proc_exit with main's exit code)
+    if wasi {
+        let main_f = funcs.iter().find(|f| f.0 == "main").ok_or("wasm32-wasi: a WASI target needs `main`")?;
+        let main_idx = fidx["main"];
+        let exit_idx = fidx["proc_exit"];
+        let main_sig = i64::from_le_bytes(main_f.1[..8].try_into().unwrap());
+        let (_, main_rets) = sig_dec(main_sig);
+        let mut a = Asm { c: vec![] };
+        a.call(main_idx);
+        if main_rets.is_empty() {
+            a.o(&[0x41, 0x00]); // main returned nothing: exit 0
+        }
+        a.call(exit_idx);
+        let mut body = vec![0x00]; // no locals
+        body.extend_from_slice(&a.c);
+        body.push(0x0B);
+        func_types.push(type_of(sig_enc(&[], &[])?, &mut types));
         bodies.push(body);
     }
     // data bytes with their relocations (8-byte addresses / table indices)
@@ -2437,9 +2607,15 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
     }
     section(&mut m, 1, &s);
     let mut s = vec![];
-    uleb(&mut s, imports.len() as u64);
+    uleb(&mut s, (imports.len() + wasi_imports.len()) as u64);
     for (im, &t) in imports.iter().zip(&import_types) {
         name_bytes(&mut s, "env");
+        name_bytes(&mut s, &im.0);
+        s.push(0x00);
+        uleb(&mut s, t as u64);
+    }
+    for (im, &t) in wasi_imports.iter().zip(&wasi_import_types) {
+        name_bytes(&mut s, "wasi_snapshot_preview1");
         name_bytes(&mut s, &im.0);
         s.push(0x00);
         uleb(&mut s, t as u64);
@@ -2480,9 +2656,14 @@ pub fn write_module(funcs: &[FuncDef], datas: &[DataDef]) -> Result<Vec<u8>, Str
     section(&mut m, 6, &s);
     // exports
     let mut ex: Vec<(String, u8, u32)> = vec![("memory".into(), 0x02, 0)];
-    for f in funcs {
-        if f.3 {
-            ex.push((f.0.clone(), 0x00, fidx[&f.0]));
+    if wasi {
+        // (a WASI command module: the host runs _start)
+        ex.push(("_start".into(), 0x00, start_idx));
+    } else {
+        for f in funcs {
+            if f.3 {
+                ex.push((f.0.clone(), 0x00, fidx[&f.0]));
+            }
         }
     }
     let mut s = vec![];
